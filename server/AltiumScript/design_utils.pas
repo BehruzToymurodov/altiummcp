@@ -330,7 +330,9 @@ begin
     Ok := False;
     Tried := False;
     if Force then ServerDoc.SetModified(True);
-    if ServerDoc.Modified then
+    // Force saves unconditionally: DoFileSave writes once the flag is set,
+    // and the flag itself is unreliable in a boolean test (see DocIsModified)
+    if Force or DocIsModified(ServerDoc) then
     begin
         Tried := True;
         Ok := ServerDoc.DoFileSave('');
@@ -338,7 +340,7 @@ begin
     Result := '{"path": ' + JStr(ServerDoc.FileName) +
               ', "attempted": ' + LowerCase(BoolToStr(Tried, True)) +
               ', "ok": ' + LowerCase(BoolToStr(Ok, True)) +
-              ', "still_modified": ' + LowerCase(BoolToStr(ServerDoc.Modified, True)) + '}';
+              ', "still_modified": ' + LowerCase(BoolToStr(DocIsModified(ServerDoc), True)) + '}';
 end;
 
 function JoinJson(A: String; B: String): String;
@@ -375,7 +377,7 @@ begin
             if (ServerDoc = nil) then
                 NotOpen := JoinJson(NotOpen, JStr(OnePath))
             else
-                Items := JoinJson(Items, SaveOneDocJson(ServerDoc, True));
+                Items := JoinJson(Items, SaveOneDocJson(ServerDoc, Force));
             I := I + 1;
             OnePath := GetFieldFromPipeString(PathList, I);
         end;

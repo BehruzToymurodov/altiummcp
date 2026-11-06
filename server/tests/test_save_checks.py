@@ -54,6 +54,48 @@ class CopiesCreated(unittest.TestCase):
         self.assertEqual(design_tools.copies_created([r"Z:\nope"], 0), [])
 
 
+class ClassifySave(unittest.TestCase):
+    def _old_file(self, d, name):
+        p = Path(d) / name
+        p.write_bytes(b"x")
+        old = time.time() - 3600
+        os.utime(p, (old, old))
+        return str(p)
+
+    def test_unattempted_named_file_is_not_written(self):
+        # Live bug: Altium skipped both files, the tool said success
+        with tempfile.TemporaryDirectory() as d:
+            p = self._old_file(d, "Board.PcbDoc")
+            r = design_tools.classify_save([{"path": p, "attempted": False}],
+                                           time.time(), must_write=True)
+            self.assertEqual(r["not_written"], [p])
+            self.assertEqual(r["skipped_unmodified"], [])
+
+    def test_unattempted_unforced_file_is_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._old_file(d, "Board.PcbDoc")
+            r = design_tools.classify_save([{"path": p, "attempted": False}],
+                                           time.time(), must_write=False)
+            self.assertEqual(r["skipped_unmodified"], [p])
+            self.assertEqual(r["not_written"], [])
+
+    def test_fresh_file_is_saved(self):
+        with tempfile.TemporaryDirectory() as d:
+            t0 = time.time()
+            p = Path(d) / "Board.PcbDoc"
+            p.write_bytes(b"x")
+            r = design_tools.classify_save([{"path": str(p), "attempted": True}],
+                                           t0, must_write=True)
+            self.assertEqual(r["saved"], [str(p)])
+
+    def test_attempted_but_old_file_is_not_written(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._old_file(d, "Board.PcbDoc")
+            r = design_tools.classify_save([{"path": p, "attempted": True}],
+                                           time.time(), must_write=False)
+            self.assertEqual(r["not_written"], [p])
+
+
 class ProjectDocumentPaths(unittest.TestCase):
     def test_reads_entries_with_bom_and_duplicates(self):
         text = ("[Design]\r\nVersion=1.0\r\n\r\n[Document1]\r\nDocumentPath=A.SchDoc\r\n"

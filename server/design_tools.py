@@ -151,6 +151,25 @@ def copies_created(folders, since: float) -> list:
     return sorted(found)
 
 
+def classify_save(docs: list, since: float, must_write: bool) -> dict:
+    """Sort Altium's save attempts into saved / not_written / skipped.
+
+    `must_write` is True when the caller named the files or forced the save:
+    then a document Altium did not even attempt counts as not written, so
+    the tool can never report success while nothing reached the disk.
+    """
+    saved, not_written, skipped = [], [], []
+    for d in docs:
+        p = d.get("path", "")
+        if written_since(p, since):
+            saved.append(p)
+        elif d.get("attempted") or must_write:
+            not_written.append(p)
+        else:
+            skipped.append(p)
+    return {"saved": saved, "not_written": not_written, "skipped_unmodified": skipped}
+
+
 def project_document_paths(prj_path: str) -> list:
     """DocumentPath= entries of a .PrjPcb, in file order (duplicates kept)."""
     try:
@@ -340,18 +359,13 @@ def register(mcp, bridge, exchange_dir: Path, write_text: Callable[[Path, str], 
             return out(r)
         res = r["result"] if isinstance(r["result"], dict) else {}
         docs = res.get("documents", [])
-        saved, not_written, skipped = [], [], []
-        for d in docs:
-            p = d.get("path", "")
-            if not d.get("attempted"):
-                skipped.append(p)
-            elif written_since(p, t0):
-                saved.append(p)
-            else:
-                not_written.append(p)
+        sorted_docs = classify_save(docs, t0, must_write=bool(paths) or force)
+        not_written = sorted_docs["not_written"]
         copies = copies_created([Path(d.get("path", "")).parent for d in docs if d.get("path")], t0)
-        result = {"saved": saved, "not_written": not_written, "copies_created": copies,
-                  "skipped_unmodified": skipped, "not_open": res.get("not_open", []),
+        result = {"saved": sorted_docs["saved"], "not_written": not_written,
+                  "copies_created": copies,
+                  "skipped_unmodified": sorted_docs["skipped_unmodified"],
+                  "not_open": res.get("not_open", []),
                   "esc_sent_to_altium": esc_sent}
         ok = not not_written and not copies and not result["not_open"]
         reply = {"success": ok, "result": result}

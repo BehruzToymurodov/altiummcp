@@ -156,6 +156,20 @@ begin
         result := 'OutJob file not found: ' + RequestedPath;
 end;
 
+// True when the document has unsaved changes. Never test ServerDoc.Modified
+// directly in an if: after SetModified(True) it returns the integer 1, and
+// DelphiScript treats only -1 as True, so "if ServerDoc.Modified then" is
+// false although BoolToStr reports True (seen live in Altium 25).
+function DocIsModified(ServerDoc: IServerDocument): Boolean;
+var
+    V : Integer;
+begin
+    Result := False;
+    if (ServerDoc = nil) then Exit;
+    V := ServerDoc.Modified;
+    Result := (V <> 0);
+end;
+
 // Return the Index-th (0-based) field of a pipe-delimited string,
 // e.g. GetFieldFromPipeString('R1|100|200', 1) = '100'.
 // Returns '' if the field does not exist.
@@ -1235,7 +1249,7 @@ begin
             ServerDoc := Client.GetDocumentByPath(Doc.DM_FullPath);
             if ServerDoc = Nil then
                 OpenState := 'closed'
-            else if ServerDoc.Modified then
+            else if DocIsModified(ServerDoc) then
             begin
                 OpenState := 'modified';
                 Inc(ModifiedCount);
