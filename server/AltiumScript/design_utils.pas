@@ -212,7 +212,7 @@ end;
 // add_document: kind (SCH/PCB), path, add_to_project (true/false)
 function ExecuteAddDocument(RequestData: TStringList): String;
 var
-    Kind, Path, Err : String;
+    Kind, Path, Err, PrjPath, Reason : String;
     AddToProject, Added, Saved : Boolean;
     Prj : IProject;
     ServerDoc : IServerDocument;
@@ -241,9 +241,25 @@ begin
 
     Added := False;
     Saved := False;
-    Prj := GetWorkspace.DM_FocusedProject;
-    if AddToProject and (Prj <> nil) and not IsScriptPrj(Prj) and
-       (Pos('Free Documents', Prj.DM_ProjectFileName) = 0) then
+    Reason := '';
+    // An explicit project wins: the focused project is often the MCP's own
+    // script project or "Free Documents", and adding there silently did nothing
+    PrjPath := ReqValue(RequestData, 'project');
+    if (PrjPath <> '') then
+    begin
+        Prj := FindOpenProject(PrjPath);
+        if (Prj = nil) then Prj := OpenProjectFile(PrjPath);
+        if (Prj = nil) then Reason := 'project not open and could not be opened: ' + PrjPath;
+    end
+    else
+        Prj := GetWorkspace.DM_FocusedProject;
+    if AddToProject and (Reason = '') then
+    begin
+        if (Prj = nil) then Reason := 'no project is focused; pass project_path'
+        else if IsScriptPrj(Prj) then Reason := 'the focused project is the MCP script project; pass project_path'
+        else if (Pos('Free Documents', Prj.DM_ProjectFileName) > 0) then Reason := 'the focused project is Free Documents; pass project_path';
+    end;
+    if AddToProject and (Reason = '') then
     begin
         Prj.DM_BeginUpdate;
         Prj.DM_AddSourceDocument(Path);
@@ -260,6 +276,8 @@ begin
               ', "opened": ' + LowerCase(BoolToStr(ServerDoc <> nil, True));
     if Added then
         Result := Result + ', "project": ' + JStr(Prj.DM_ProjectFullPath);
+    if (Reason <> '') then
+        Result := Result + ', "not_added_reason": ' + JStr(Reason);
     Result := Result + '}';
 end;
 
@@ -302,19 +320,67 @@ begin
         Result := '{"opened": ' + JStr(Path) + ', "kind": ' + JStr(Kind) + '}';
 end;
 
-// save_documents: scope = "active" (default) or "project"
+// One save attempt as a JSON object. Force marks the document modified first:
+// changes made through the scripting API do not set that flag, and an
+// unmodified document is skipped by Altium's save.
+function SaveOneDocJson(ServerDoc: IServerDocument; Force: Boolean): String;
+var
+    Ok, Tried : Boolean;
+begin
+    Ok := False;
+    Tried := False;
+    if Force then ServerDoc.SetModified(True);
+    if ServerDoc.Modified then
+    begin
+        Tried := True;
+        Ok := ServerDoc.DoFileSave('');
+    end;
+    Result := '{"path": ' + JStr(ServerDoc.FileName) +
+              ', "attempted": ' + LowerCase(BoolToStr(Tried, True)) +
+              ', "ok": ' + LowerCase(BoolToStr(Ok, True)) +
+              ', "still_modified": ' + LowerCase(BoolToStr(ServerDoc.Modified, True)) + '}';
+end;
+
+function JoinJson(A: String; B: String): String;
+begin
+    if (A = '') then Result := B else Result := A + ', ' + B;
+end;
+
+// save_documents: scope = "active" (default) or "project"; or paths = one or
+// more document paths separated by '|' (open documents only), which wins over
+// scope; force = mark documents modified before saving (default true).
+// Returns every attempt: the Python side checks each file on disk afterwards,
+// because DoFileSave can report success for a save Altium turned into a copy.
 function ExecuteSaveDocuments(RequestData: TStringList): String;
 var
-    Scope, List : String;
+    Scope, PathList, OnePath, Items, NotOpen : String;
+    Force, PrjOk : Boolean;
     Prj : IProject;
-    I, N : Integer;
+    I : Integer;
     Doc : IDocument;
     ServerDoc : IServerDocument;
 begin
     Scope := LowerCase(ReqValue(RequestData, 'scope'));
-    List := '';
-    N := 0;
-    if (Scope = 'project') then
+    Force := (LowerCase(ReqValue(RequestData, 'force')) <> 'false');
+    PathList := ReqValue(RequestData, 'paths');
+    Items := '';
+    NotOpen := '';
+    if (PathList <> '') then
+    begin
+        I := 0;
+        OnePath := GetFieldFromPipeString(PathList, I);
+        while (OnePath <> '') do
+        begin
+            ServerDoc := Client.GetDocumentByPath(OnePath);
+            if (ServerDoc = nil) then
+                NotOpen := JoinJson(NotOpen, JStr(OnePath))
+            else
+                Items := JoinJson(Items, SaveOneDocJson(ServerDoc, True));
+            I := I + 1;
+            OnePath := GetFieldFromPipeString(PathList, I);
+        end;
+    end
+    else if (Scope = 'project') then
     begin
         Prj := GetWorkspace.DM_FocusedProject;
         if (Prj = nil) then
@@ -326,20 +392,13 @@ begin
         begin
             Doc := Prj.DM_LogicalDocuments(I);
             ServerDoc := Client.GetDocumentByPath(Doc.DM_FullPath);
-            if (ServerDoc <> nil) and ServerDoc.Modified then
-                if ServerDoc.DoFileSave('') then
-                begin
-                    if (List <> '') then List := List + ', ';
-                    List := List + JStr(Doc.DM_FullPath);
-                    N := N + 1;
-                end;
+            if (ServerDoc <> nil) then
+                Items := JoinJson(Items, SaveOneDocJson(ServerDoc, Force));
         end;
-        if SaveProjectFile(Prj) then
-        begin
-            if (List <> '') then List := List + ', ';
-            List := List + JStr(Prj.DM_ProjectFullPath);
-            N := N + 1;
-        end;
+        PrjOk := SaveProjectFile(Prj);
+        Items := JoinJson(Items, '{"path": ' + JStr(Prj.DM_ProjectFullPath) +
+                 ', "attempted": true, "ok": ' + LowerCase(BoolToStr(PrjOk, True)) +
+                 ', "still_modified": false}');
     end
     else
     begin
@@ -349,14 +408,9 @@ begin
             Result := 'ERROR: no active document';
             Exit;
         end;
-        ServerDoc.SetModified(True);
-        if ServerDoc.DoFileSave('') then
-        begin
-            List := JStr(ServerDoc.FileName);
-            N := 1;
-        end;
+        Items := SaveOneDocJson(ServerDoc, True);
     end;
-    Result := '{"saved_count": ' + IntToStr(N) + ', "saved": [' + List + ']}';
+    Result := '{"documents": [' + Items + '], "not_open": [' + NotOpen + ']}';
 end;
 
 // Compile the focused project and bring its PCB to the front, ready for

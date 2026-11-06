@@ -361,7 +361,45 @@ class AltiumBridge:
                 await asyncio.sleep(0.25)
         return text
 
+    @staticmethod
+    def _handle_new_dialogs(baseline: set, seen: Dict[int, float], handled: list) -> None:
+        """Answer dialogs that appeared during this command and record them.
+
+        A Yes/No box raised by what the command did (Altium's "save copy of
+        current document?") would otherwise sit there until the request times
+        out. Dialogs open before the command started are the user's and are
+        never touched; script-error dialogs are left to the debugger recovery.
+        Each one is photographed first, because Altium's message boxes keep
+        their text in a windowless label nothing else can read.
+        """
+        now = time.time()
+        for d in sandbox.altium_dialogs():
+            if d.hwnd in baseline or d.is_script_error:
+                continue
+            first = seen.setdefault(d.hwnd, now)
+            if now - first < 1.0:
+                continue  # let it finish drawing before the snapshot
+            baseline.add(d.hwnd)  # handled once
+            shot = sandbox.snapshot_dialog(d, EXCHANGE_DIR / "dialogs")
+            answer = sandbox.click_safe_button(d)
+            entry = {"title": d.title, "text": d.text, "buttons": d.buttons,
+                     "answered": answer, "snapshot": shot}
+            logger.warning(f"Answered an Altium dialog during the command: {entry}")
+            handled.append(entry)
+
     async def _execute_command_locked(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        dialog_baseline = {d.hwnd for d in sandbox.altium_dialogs()}
+        dialog_seen: Dict[int, float] = {}
+        dialogs_handled: list = []
+        response = await self._execute_command_inner(command, params, dialog_baseline,
+                                                     dialog_seen, dialogs_handled)
+        if dialogs_handled and isinstance(response, dict):
+            response["dialogs"] = dialogs_handled
+        return response
+
+    async def _execute_command_inner(self, command: str, params: Dict[str, Any],
+                                     dialog_baseline: set, dialog_seen: Dict[int, float],
+                                     dialogs_handled: list) -> Dict[str, Any]:
         try:
             # Clean up any existing response file
             if RESPONSE_FILE.exists():
@@ -441,6 +479,7 @@ class AltiumBridge:
                         RESPONSE_FILE.unlink()
                     except OSError:
                         pass
+                self._handle_new_dialogs(dialog_baseline, dialog_seen, dialogs_handled)
                 await asyncio.sleep(0.25)
             else:
                 logger.error("Timeout waiting for response from Altium")

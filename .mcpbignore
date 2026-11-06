@@ -1,0 +1,19 @@
+# Files left out of the installable package (scripts/pack.ps1).
+# The package needs only manifest.json, start_server.py, requirements.txt,
+# pyproject.toml and server/ (minus its tests).
+.git/
+.gitignore
+.mcpbignore
+.python-version
+.venv/
+dist/
+scripts/
+dev/
+assets/
+server/tests/
+**/__pycache__/
+*.log
+*.png
+*.md
+uv.lock
+test..txt

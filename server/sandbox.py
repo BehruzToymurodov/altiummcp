@@ -30,7 +30,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
@@ -215,6 +215,14 @@ def map_error_line(built: BuiltScript, message: str) -> Optional[dict]:
 WM_CLOSE = 0x0010
 WM_COMMAND = 0x0111
 IDCANCEL = 2
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+VK_ESCAPE = 0x1B
+BM_CLICK = 0x00F5
+# Buttons answered in this order when the MCP has to close a dialog it did not
+# ask for. Never 'Yes': Altium's Yes/No boxes ask things like "save a copy of
+# the current document?", and Yes there writes 'Copy of ...' files.
+SAFE_BUTTONS = ("No", "Cancel", "Abort", "Ignore", "OK", "Close")
 
 
 def _process_name(hwnd) -> str:
@@ -249,6 +257,8 @@ class Dialog:
     cls: str
     title: str
     text: str = ""
+    # Captions of the dialog's push buttons, '&' accelerators removed
+    buttons: List[str] = field(default_factory=list)
 
     @property
     def is_script_error(self) -> bool:
@@ -280,7 +290,7 @@ def altium_dialogs() -> List[Dialog]:
             return True
         if _process_name(hwnd).lower() != "x2.exe":
             return True
-        parts = []
+        parts, buttons = [], []
 
         def child(h, __):
             c = ctypes.create_unicode_buffer(32)
@@ -289,10 +299,14 @@ def altium_dialogs() -> List[Dialog]:
                 t = _window_text(h).strip()
                 if t:
                     parts.append(t)
+            elif c.value in ("Button", "TButton") and user32.IsWindowVisible(h):
+                t = _window_text(h).replace("&", "").strip()
+                if t:
+                    buttons.append(t)
             return True
 
         user32.EnumChildWindows(hwnd, proto(child), 0)
-        found.append(Dialog(int(hwnd), cls.value, title, " ".join(" ".join(parts).split())))
+        found.append(Dialog(int(hwnd), cls.value, title, " ".join(" ".join(parts).split()), buttons))
         return True
 
     user32.EnumWindows(proto(top), 0)
@@ -306,6 +320,105 @@ def answer_dialog(d: Dialog) -> None:
         user32.PostMessageW(d.hwnd, WM_COMMAND, IDCANCEL, 0)
     else:
         user32.PostMessageW(d.hwnd, WM_CLOSE, 0, 0)
+
+
+def click_safe_button(d: Dialog) -> str:
+    """Answer a dialog the MCP did not ask for with its safest button.
+
+    Clicks the first of SAFE_BUTTONS the dialog has (No before Cancel before
+    OK) and returns that caption. A dialog with none of them gets WM_CLOSE and
+    "closed" is returned. 'Yes' is never clicked.
+    """
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    by_caption = {}
+
+    def child(h, _):
+        c = ctypes.create_unicode_buffer(32)
+        user32.GetClassNameW(h, c, 32)
+        if c.value in ("Button", "TButton") and user32.IsWindowVisible(h):
+            by_caption.setdefault(_window_text(h).replace("&", "").strip().lower(), h)
+        return True
+
+    user32.EnumChildWindows(d.hwnd, proto(child), 0)
+    for caption in SAFE_BUTTONS:
+        h = by_caption.get(caption.lower())
+        if h:
+            user32.PostMessageW(h, BM_CLICK, 0, 0)
+            return caption
+    user32.PostMessageW(d.hwnd, WM_CLOSE, 0, 0)
+    return "closed"
+
+
+def snapshot_dialog(d: Dialog, out_dir: Path) -> Optional[str]:
+    """Save a PNG of the dialog and return its path.
+
+    Altium's TMessageForm draws its message with a windowless label, so the
+    text cannot be read back with Win32 or UI Automation; a picture is the
+    only faithful record of what the dialog asked.
+    """
+    try:
+        from ctypes import wintypes
+        from PIL import ImageGrab
+        rect = wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(d.hwnd, ctypes.byref(rect)):
+            return None
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"dialog_{time.strftime('%Y%m%d_%H%M%S')}_{d.hwnd}.png"
+        ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom), all_screens=True).save(path)
+        return str(path)
+    except Exception:
+        return None
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    from ctypes import wintypes as _w
+    _fields_ = [("cbSize", _w.DWORD), ("flags", _w.DWORD), ("hwndActive", _w.HWND),
+                ("hwndFocus", _w.HWND), ("hwndCapture", _w.HWND), ("hwndMenuOwner", _w.HWND),
+                ("hwndMoveSize", _w.HWND), ("hwndCaret", _w.HWND), ("rcCaret", _w.RECT)]
+
+
+def altium_main_windows() -> List[int]:
+    """Visible top-level windows of X2.EXE whose title names Altium Designer."""
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    found: List[int] = []
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def top(hwnd, _):
+        if user32.IsWindowVisible(hwnd) and "Altium Designer" in _window_text(hwnd)                 and _process_name(hwnd).lower() == "x2.exe":
+            found.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(proto(top), 0)
+    return found
+
+
+def cancel_active_command() -> int:
+    """End an interactive command left running in Altium's editor.
+
+    While one is active (a placement or routing tool, a half-finished
+    selection), Altium refuses to save and offers to "save copy of current
+    document" instead. Esc ends it, as it does for a user at the keyboard.
+    The key is posted to the control that has focus in Altium's own GUI
+    thread, so it never reaches whatever window the user has in front.
+    Returns how many windows received it.
+    """
+    user32 = ctypes.windll.user32
+    sent = 0
+    for hwnd in altium_main_windows():
+        tid = user32.GetWindowThreadProcessId(hwnd, None)
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        if not user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            continue
+        target = info.hwndFocus or info.hwndActive or hwnd
+        for _ in range(2):
+            user32.PostMessageW(target, WM_KEYDOWN, VK_ESCAPE, 0x00010001)
+            user32.PostMessageW(target, WM_KEYUP, VK_ESCAPE, 0xC0010001)
+        sent += 1
+    return sent
 
 
 # One counter per server process: a Sandbox is created for every call, so a
